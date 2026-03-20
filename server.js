@@ -164,7 +164,7 @@ async function getAvailableSlots() {
   const eventTypeUri = await getEventTypeUri(userUri);
 
   const startTime = new Date(Date.now() + 60 * 1000).toISOString(); // 60s buffer
-  const endTime = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+  const endTime = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
   const response = await axios.get(
     "https://api.calendly.com/event_type_available_times",
@@ -408,9 +408,12 @@ app.post("/book-appointment", async (req, res) => {
   const callId = req.body?.call?.call_id || null;
   const { name, start_time, phone } = payload;
 
-  // Auto-generate email from phone: intake+7737101160@buchananlaw.com
+  // Use email from form data if available, fall back to auto-generated
+  const existingLead = leads.find((l) => l.phone === normalizePhone(phone));
   const digits = String(phone || "").replace(/\D/g, "").slice(-10);
-  const email = digits ? `intake+${digits}@${process.env.EMAIL_DOMAIN || "buchananlaw.com"}` : null;
+  const email =
+    existingLead?.formData?.email ||
+    (digits ? `intake+${digits}@${process.env.EMAIL_DOMAIN || "buchananlaw.com"}` : null);
 
   console.log("Book appointment payload:", payload, "callId:", callId, "email:", email);
 
