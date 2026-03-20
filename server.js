@@ -60,14 +60,48 @@ function logLead(data) {
 }
 
 function readableTime(isoString) {
-  return new Date(isoString).toLocaleString("en-US", {
+  const slotDate = new Date(isoString);
+  const tz = "America/Chicago";
+
+  const toDateKey = (d) =>
+    d.toLocaleDateString("en-US", { timeZone: tz, year: "numeric", month: "numeric", day: "numeric" });
+
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+
+  const timeStr = slotDate.toLocaleString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: tz,
+  });
+
+  if (toDateKey(slotDate) === toDateKey(new Date())) return `today at ${timeStr}`;
+  if (toDateKey(slotDate) === toDateKey(tomorrow)) return `tomorrow at ${timeStr}`;
+
+  return slotDate.toLocaleString("en-US", {
     weekday: "long",
     month: "long",
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
-    timeZone: "America/Chicago",
+    timeZone: tz,
   });
+}
+
+function noSlotsMessage() {
+  const now = new Date().toLocaleString("en-US", { timeZone: "America/Chicago" });
+  const ct = new Date(now);
+  const day = ct.getDay();
+  const totalMinutes = ct.getHours() * 60 + ct.getMinutes();
+
+  const withinResponseWindow =
+    (day >= 1 && day <= 4 && totalMinutes < 16 * 60 + 30) ||
+    (day === 5 && totalMinutes < 14 * 60 + 30);
+
+  if (withinResponseWindow) {
+    return "There are no available slots on the calendar right now, but the intake team will see your information and reach out within the next 15 minutes or so.";
+  }
+  return "There are no available slots on the calendar right now, but rest assured the intake team will be in touch with you first thing when the office opens.";
 }
 
 function readableDay(isoString) {
@@ -147,12 +181,25 @@ async function getAvailableSlots() {
     }
   );
 
-  const slots = response.data.collection.slice(0, 4);
+  // Group all slots by day (up to 4 slots per day, across all 5 days)
+  const grouped = {};
+  for (const slot of response.data.collection) {
+    const dayLabel = new Date(slot.start_time).toLocaleDateString("en-US", {
+      weekday: "long",
+      month: "long",
+      day: "numeric",
+      timeZone: "America/Chicago",
+    });
+    if (!grouped[dayLabel]) grouped[dayLabel] = [];
+    if (grouped[dayLabel].length < 4) {
+      grouped[dayLabel].push({
+        readable: readableTime(slot.start_time),
+        start_time: slot.start_time,
+      });
+    }
+  }
 
-  return slots.map((slot) => ({
-    readable: readableTime(slot.start_time),
-    start_time: slot.start_time,
-  }));
+  return grouped;
 }
 
 // ─────────────────────────────────────────────
@@ -288,7 +335,7 @@ app.post("/new-lead", async (req, res) => {
       return res.status(400).json({ message: "Lead missing phone number" });
     }
 
-    const isDebug = data.debug !== false; // safe by default; Waqar sets debug:false for real leads
+    const isDebug = data.debug !== false && data.debug !== "false"; // handles both boolean and string
     const lead = logLead(data);
     console.log(`Lead created: ${lead.firstName} — ${lead.phone} | debug=${isDebug}`);
 
@@ -324,41 +371,28 @@ app.post("/new-lead", async (req, res) => {
 app.post("/get-available-slots", async (req, res) => {
   try {
     console.log("Fetching Calendly available slots...");
-    const slots = await getAvailableSlots();
+    const grouped = await getAvailableSlots();
 
-    if (slots.length === 0) {
+    if (Object.keys(grouped).length === 0) {
       return res.json({
-        result: `No available slots in the next 5 days. Direct the lead to book at ${process.env.CALENDLY_URL}`,
-        time_slot_1: "",
-        time_slot_2: "",
-        next_available_time: "",
+        result: noSlotsMessage(),
+        days: [],
       });
     }
 
-    const [slot1, slot2, slot3] = slots;
-    const time_slot_1 = slot1?.readable || "";
-    const time_slot_2 = slot2?.readable || slot1?.readable || "";
-    const next_available_time = slot1?.readable || "";
-
-    const slotLines = slots
-      .slice(0, 2)
-      .map((s, i) => `Option ${i + 1}: ${s.readable}`)
-      .join(". ");
+    const days = Object.entries(grouped).map(([day, slots]) => ({ day, slots }));
+    const summary = days
+      .map((d) => `${d.day}: ${d.slots.map((s) => s.readable.split(", ").pop()).join(", ")}`)
+      .join(" | ");
 
     res.json({
-      result: `Here are the next available times: ${slotLines}`,
-      time_slot_1,
-      time_slot_2,
-      next_available_time,
-      slots,
+      result: `Available times by day — ${summary}`,
+      days,
     });
   } catch (error) {
     console.error("Get slots error:", error.response?.data || error.message);
     res.json({
-      result: `I wasn't able to pull up the calendar right now. Have the lead book directly at ${process.env.CALENDLY_URL}`,
-      time_slot_1: "",
-      time_slot_2: "",
-      next_available_time: "",
+      result: noSlotsMessage(),
       error: error.message,
     });
   }
@@ -414,7 +448,7 @@ app.post("/book-appointment", async (req, res) => {
   } catch (error) {
     console.error("Book appointment error:", error.response?.data || error.message);
     res.json({
-      result: `Error: I wasn't able to lock that in. Someone from our intake team will reach out to get this scheduled.`,
+      result: `I wasn't able to lock that in on my end. ${noSlotsMessage()}`,
       appointment_day: "",
       appointment_time: "",
       error: error.response?.data || error.message,
