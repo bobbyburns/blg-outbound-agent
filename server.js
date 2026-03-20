@@ -571,15 +571,11 @@ app.post("/retell-webhook", async (req, res) => {
           : "",
       };
 
-      const webhookUrls = [
-        "https://hooks.zapier.com/hooks/catch/1612265/upksr1x/",
-        process.env.ZAPIER_WEBHOOK_URL,
-      ].filter(Boolean);
-
-      for (const url of webhookUrls) {
+      const zapierUrl = process.env.ZAPIER_WEBHOOK_URL;
+      if (zapierUrl) {
         axios
-          .post(url, zapierPayload)
-          .catch((e) => console.error(`Zapier webhook failed (${url}):`, e.message));
+          .post(zapierUrl, zapierPayload)
+          .catch((e) => console.error("Zapier webhook failed:", e.message));
       }
     }
 
