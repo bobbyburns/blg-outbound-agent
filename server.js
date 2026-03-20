@@ -257,12 +257,19 @@ async function bookAppointment({ name, email, start_time, phone }) {
 // RETELL — TRIGGER OUTBOUND CALL
 // ─────────────────────────────────────────────
 async function triggerRetellCall(lead) {
+  const isRetry = lead.callAttempts >= 2;
+  const firstName = lead.firstName || "there";
+  const voicemailMessage = isRetry
+    ? `Hi ${firstName} — this is Maria calling from Buchanan Law Group. You filled out a form about your divorce situation and I just wanted to follow up. Give us a call back at your convenience at 312-757-4833 — again, that's 312-757-4833. Talk soon.`
+    : null;
+
   const response = await axios.post(
     "https://api.retellai.com/v2/create-phone-call",
     {
       agent_id: process.env.RETELL_AGENT_ID,
       from_number: process.env.TWILIO_PHONE_NUMBER,
       to_number: lead.phone,
+      ...(voicemailMessage && { voicemail_message: voicemailMessage }),
       retell_llm_dynamic_variables: {
         // Always-present system vars
         first_name: lead.firstName,
