@@ -522,28 +522,64 @@ app.post("/retell-webhook", async (req, res) => {
         result = "disqualified";
 
       // Send call data to Zapier
-      const zapierUrl = process.env.ZAPIER_WEBHOOK_URL;
-      if (zapierUrl) {
+      const zapierPayload = {
+        // ── Call identity ──────────────────────────────
+        call_id: callId,
+        agent_id: call.agent_id || "",
+        call_type: call.call_type || "outbound",
+        call_status: call.call_status || "",
+        from_number: call.from_number || "",
+        to_number: call.to_number || "",
+
+        // ── Lead identity ──────────────────────────────
+        lead_id: lead?.id || "",
+        name: lead?.firstName || call.retell_llm_dynamic_variables?.first_name || "",
+        phone: lead?.phone || call.to_number || "",
+        source: lead?.source || "",
+        received_at: lead?.receivedAt || "",
+
+        // ── All original form fields ───────────────────
+        ...(lead?.formData || {}),
+
+        // ── Call outcome ───────────────────────────────
+        result,
+        ended_reason: endedReason,
+        duration_ms: duration,
+        duration_seconds: Math.round(duration / 1000),
+        start_timestamp: call.start_timestamp || "",
+        end_timestamp: call.end_timestamp || "",
+
+        // ── Appointment ────────────────────────────────
+        appointment_booked: apptBooked,
+        appointment_time: apptTime ? readableTime(apptTime) : "",
+        appointment_time_iso: apptTime || "",
+
+        // ── AI analysis ────────────────────────────────
+        summary,
+        transcript,
+        call_successful: call.call_analysis?.call_successful ?? null,
+        user_sentiment: call.call_analysis?.user_sentiment || "",
+        agent_task_completion_rating: call.call_analysis?.agent_task_completion_rating || "",
+        agent_task_completion_rating_reason: call.call_analysis?.agent_task_completion_rating_reason || "",
+        custom_analysis_data: call.call_analysis?.custom_analysis_data
+          ? JSON.stringify(call.call_analysis.custom_analysis_data)
+          : "",
+
+        // ── Dynamic variables passed to agent ──────────
+        llm_variables: call.retell_llm_dynamic_variables
+          ? JSON.stringify(call.retell_llm_dynamic_variables)
+          : "",
+      };
+
+      const webhookUrls = [
+        "https://hooks.zapier.com/hooks/catch/1612265/upksr1x/",
+        process.env.ZAPIER_WEBHOOK_URL,
+      ].filter(Boolean);
+
+      for (const url of webhookUrls) {
         axios
-          .post(zapierUrl, {
-            call_id: callId,
-            name: lead?.firstName || call.retell_llm_dynamic_variables?.first_name || "",
-            phone: lead?.phone || call.to_number || "",
-            from_number: call.from_number || "",
-            to_number: call.to_number || "",
-            result,
-            appointment_booked: apptBooked,
-            appointment_time: apptTime ? readableTime(apptTime) : "",
-            appointment_time_iso: apptTime || "",
-            // All original form fields passed back for CRM logging
-            ...(lead?.formData || {}),
-            summary,
-            transcript,
-            ended_reason: endedReason,
-            duration_ms: duration,
-            received_at: lead?.receivedAt || new Date().toISOString(),
-          })
-          .catch((e) => console.error("Zapier webhook failed:", e.message));
+          .post(url, zapierPayload)
+          .catch((e) => console.error(`Zapier webhook failed (${url}):`, e.message));
       }
     }
 
