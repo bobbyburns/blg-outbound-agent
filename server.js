@@ -51,6 +51,7 @@ function logLead(data) {
     receivedAt: new Date().toISOString(),
     callStatus: "pending",
     callId: null,
+    callAttempts: 0,
     qualificationData: {},
     appointmentBooked: false,
     appointmentTime: null,
@@ -345,11 +346,12 @@ app.post("/new-lead", async (req, res) => {
       return res.json({ success: true, leadId: lead.id, message: "Lead received (debug mode — no call placed)" });
     }
 
+    lead.callAttempts += 1;
     triggerRetellCall(lead)
       .then((callResult) => {
         lead.callId = callResult.call_id || callResult.id;
         lead.callStatus = "queued";
-        console.log(`Call queued for ${lead.firstName}: ${lead.callId}`);
+        console.log(`Call queued for ${lead.firstName} (attempt ${lead.callAttempts}): ${lead.callId}`);
       })
       .catch((err) => {
         lead.callStatus = "call_failed";
@@ -484,6 +486,8 @@ app.post("/retell-webhook", async (req, res) => {
       const endedReason = call.disconnection_reason || "";
       const duration = call.duration_ms || 0;
 
+      const noAnswer = endedReason === "dial_no_answer" || endedReason === "customer_did_not_pick_up";
+
       if (lead) {
         lead.callStatus = "completed";
         lead.qualificationData = {
@@ -499,6 +503,23 @@ app.post("/retell-webhook", async (req, res) => {
           summary.toLowerCase().includes("schedul")
         ) {
           lead.appointmentBooked = true;
+        }
+
+        // Retry immediately on no-answer — max 2 attempts total
+        if (noAnswer && lead.callAttempts < 2) {
+          lead.callAttempts += 1;
+          console.log(`No answer for ${lead.firstName} — retrying immediately (attempt ${lead.callAttempts})`);
+          triggerRetellCall(lead)
+            .then((callResult) => {
+              lead.callId = callResult.call_id || callResult.id;
+              lead.callStatus = "queued";
+              console.log(`Retry call queued for ${lead.firstName}: ${lead.callId}`);
+            })
+            .catch((err) => {
+              lead.callStatus = "call_failed";
+              console.error("Retry call failed:", err.response?.data || err.message);
+            });
+          return res.sendStatus(200);
         }
       }
 
