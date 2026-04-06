@@ -79,6 +79,29 @@ function noSlotsMessage() {
   return "There are no available slots on the calendar right now, but rest assured the intake team will be in touch with you first thing when the office opens.";
 }
 
+// Fire-and-forget Supabase log helper — never throws
+function logCallEvent(callId, fields) {
+  if (!callId) return;
+  supabase
+    .from("call_logs")
+    .upsert({ call_id: callId, ...fields }, { onConflict: "call_id" })
+    .then(() => {}, (e) => console.error("[call_logs] upsert failed:", e.message));
+}
+
+function logWebhookEvent(eventType, callId, call) {
+  supabase
+    .from("webhook_events")
+    .insert({
+      event_type: eventType,
+      call_id: callId || null,
+      from_number: call.from_number || null,
+      to_number: call.to_number || null,
+      payload_summary: JSON.stringify({ event: eventType, call_id: callId, disconnection_reason: call.disconnection_reason }),
+      received_at: new Date().toISOString(),
+    })
+    .then(() => {}, (e) => console.error("[webhook_events] insert failed:", e.message));
+}
+
 // ─────────────────────────────────────────────
 // SUPABASE LEAD HELPERS
 // ─────────────────────────────────────────────
@@ -100,8 +123,7 @@ async function createLead(data) {
     .select()
     .single();
   if (error) {
-    console.error("Error creating lead:", error.message);
-    // Return a local object so the call can still proceed
+    console.error("[createLead] Error:", error.message);
     return { ...lead, id: Date.now().toString() };
   }
   return row;
@@ -109,7 +131,7 @@ async function createLead(data) {
 
 async function updateLead(id, fields) {
   const { error } = await supabase.from("blg_outbound_leads").update(fields).eq("id", id);
-  if (error) console.error("Error updating lead:", error.message);
+  if (error) console.error("[updateLead] Error:", error.message);
 }
 
 async function getLeadByCallId(callId) {
@@ -164,7 +186,7 @@ async function getEventTypeUri(orgUri) {
   const slug = process.env.CALENDLY_EVENT_SLUG;
   const eventType = response.data.collection.find((e) => e.scheduling_url.includes(slug));
   if (!eventType) throw new Error(`Event type with slug "${slug}" not found`);
-  console.log("Event type found:", eventType.uri);
+  console.log("[calendly] Event type found:", eventType.uri);
   return eventType.uri;
 }
 
@@ -193,7 +215,7 @@ async function getAvailableSlots() {
 async function bookAppointment({ name, email, start_time, phone }) {
   const orgUri = await getCalendlyUserUri();
   const eventTypeUri = await getEventTypeUri(orgUri);
-  console.log("BOOKING INPUT:", { name, email, start_time, phone, eventTypeUri });
+  console.log("[book-appointment] INPUT:", { name, email, start_time, phone, eventTypeUri });
   const payload = {
     event_type: eventTypeUri,
     start_time,
@@ -202,12 +224,12 @@ async function bookAppointment({ name, email, start_time, phone }) {
       ? [{ question: "Phone Number", answer: String(phone), position: 0 }]
       : [],
   };
-  console.log("BOOKING PAYLOAD:", JSON.stringify(payload, null, 2));
+  console.log("[book-appointment] PAYLOAD:", JSON.stringify(payload, null, 2));
   const response = await axios.post("https://api.calendly.com/invitees", payload, {
     headers: { Authorization: `Bearer ${process.env.CALENDLY_API_KEY}`, "Content-Type": "application/json" },
   });
   const invitee = response.data?.resource;
-  console.log("BOOKING SUCCESS:", JSON.stringify(response.data, null, 2));
+  console.log("[book-appointment] SUCCESS:", JSON.stringify(response.data, null, 2));
   return {
     success: true,
     invitee_uri: invitee?.uri || null,
@@ -231,6 +253,8 @@ async function triggerRetellCall(lead) {
 
   const formData = lead.form_data || {};
 
+  console.log(`[triggerRetellCall] Lead: ${lead.name} | ${lead.phone} | attempt: ${lead.call_attempts} | retry: ${isRetry}`);
+
   const response = await axios.post(
     "https://api.retellai.com/v2/create-phone-call",
     {
@@ -242,7 +266,6 @@ async function triggerRetellCall(lead) {
         first_name: firstName,
         phone_number: displayPhone(lead.phone),
         today: todayLabel(),
-        // Spread all raw form fields as dynamic variables
         ...Object.fromEntries(
           Object.entries(formData).map(([k, v]) => [k, String(v ?? "")])
         ),
@@ -255,6 +278,8 @@ async function triggerRetellCall(lead) {
       },
     }
   );
+
+  console.log(`[triggerRetellCall] Call created: ${response.data.call_id || response.data.id}`);
   return response.data;
 }
 
@@ -262,19 +287,17 @@ async function triggerRetellCall(lead) {
 // ROUTES
 // ═════════════════════════════════════════════
 
-// Health check
 app.get("/", (req, res) => {
   res.json({ status: "BLG Outbound Agent running" });
 });
 
 // ─────────────────────────────────────────────
-// Facebook / Zapier lead webhook
-// POST /new-lead
+// POST /new-lead — Facebook / Zapier webhook
 // ─────────────────────────────────────────────
 app.post("/new-lead", async (req, res) => {
   try {
     const data = req.body;
-    console.log("New lead received:", data);
+    console.log("[new-lead] Received:", JSON.stringify(data));
 
     if (!data.phone && !data.number) {
       return res.status(400).json({ message: "Lead missing phone number" });
@@ -282,7 +305,7 @@ app.post("/new-lead", async (req, res) => {
 
     const isDebug = data.debug === true || data.debug === "true";
     const lead = await createLead(data);
-    console.log(`Lead created: ${lead.name} — ${lead.phone} | debug=${isDebug}`);
+    console.log(`[new-lead] Lead created: ${lead.name} — ${lead.phone} | id: ${lead.id} | debug: ${isDebug}`);
 
     if (isDebug) {
       await updateLead(lead.id, { call_status: "debug_skipped" });
@@ -295,56 +318,68 @@ app.post("/new-lead", async (req, res) => {
       .then(async (callResult) => {
         const callId = callResult.call_id || callResult.id;
         await updateLead(lead.id, { call_id: callId, call_status: "queued" });
-        console.log(`Call queued for ${lead.name} (attempt 1): ${callId}`);
+        logCallEvent(callId, {
+          from_number: process.env.TWILIO_PHONE_NUMBER || null,
+          to_number: lead.phone,
+          lead_id: lead.id,
+          call_triggered_at: new Date().toISOString(),
+          call_attempt: 1,
+        });
+        console.log(`[new-lead] Call queued for ${lead.name} (attempt 1): ${callId}`);
       })
       .catch(async (err) => {
+        const errMsg = err.response?.data ? JSON.stringify(err.response.data) : err.message;
         await updateLead(lead.id, { call_status: "call_failed" });
-        console.error("Call trigger failed:", err.response?.data || err.message);
+        console.error("[new-lead] Call trigger failed:", errMsg);
       });
 
     res.json({ success: true, leadId: lead.id, message: "Lead received, call queued" });
   } catch (error) {
-    console.error("Lead webhook error:", error);
+    console.error("[new-lead] Error:", error.message);
     res.status(500).json({ message: "Server error", error: error.message });
   }
 });
 
 // ─────────────────────────────────────────────
-// Manual test call
-// GET /start-call?number=7737101160&name=Bobby
+// GET /start-call — Manual test
 // ─────────────────────────────────────────────
 app.get("/start-call", async (req, res) => {
   try {
     const { number, name } = req.query;
     if (!number) return res.status(400).json({ message: "Missing ?number=" });
 
-    const lead = await createLead({
-      phone: number,
-      name: name || "Test Lead",
-      source: "test",
-    });
-
-    const callResult = await triggerRetellCall(lead);
+    const lead = await createLead({ phone: number, name: name || "Test Lead", source: "test" });
+    const callResult = await triggerRetellCall({ ...lead, call_attempts: 1 });
     const callId = callResult.call_id || callResult.id;
     await updateLead(lead.id, { call_id: callId, call_status: "queued", call_attempts: 1 });
+    logCallEvent(callId, {
+      from_number: process.env.TWILIO_PHONE_NUMBER || null,
+      to_number: lead.phone,
+      lead_id: lead.id,
+      call_triggered_at: new Date().toISOString(),
+      call_attempt: 1,
+    });
 
-    res.json({ success: true, lead, callResult });
+    res.json({ success: true, lead, callId });
   } catch (error) {
-    console.error("Start call error:", error.response?.data || error.message);
+    console.error("[start-call] Error:", error.response?.data || error.message);
     res.status(500).json({ message: "Call failed", error: error.response?.data || error.message });
   }
 });
 
 // ─────────────────────────────────────────────
-// Retell Tool: Get available Calendly slots
-// POST /get-available-slots
+// POST /get-available-slots — Retell tool
 // ─────────────────────────────────────────────
 app.post("/get-available-slots", async (req, res) => {
+  const callId = req.body?.call?.call_id || null;
+  console.log(`[get-available-slots] callId: ${callId}`);
+
   try {
-    console.log("Fetching Calendly available slots...");
     const grouped = await getAvailableSlots();
 
     if (Object.keys(grouped).length === 0) {
+      console.log("[get-available-slots] No slots available");
+      logCallEvent(callId, { slots_error: "no_slots_available" });
       return res.json({ result: noSlotsMessage(), days: [] });
     }
 
@@ -353,16 +388,18 @@ app.post("/get-available-slots", async (req, res) => {
       .map((d) => `${d.day}: ${d.slots.map((s) => s.readable.split(", ").pop()).join(", ")}`)
       .join(" | ");
 
+    console.log(`[get-available-slots] Slots found: ${summary}`);
     res.json({ result: `Available times by day — ${summary}`, days });
   } catch (error) {
-    console.error("Get slots error:", error.response?.data || error.message);
-    res.json({ result: noSlotsMessage(), error: error.message });
+    const errMsg = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+    console.error("[get-available-slots] Calendly error:", error.response?.status, errMsg);
+    logCallEvent(callId, { slots_error: errMsg });
+    res.json({ result: noSlotsMessage(), error: errMsg });
   }
 });
 
 // ─────────────────────────────────────────────
-// Retell Tool: Book appointment
-// POST /book-appointment
+// POST /book-appointment — Retell tool
 // ─────────────────────────────────────────────
 app.post("/book-appointment", async (req, res) => {
   const payload = req.body?.args || req.body || {};
@@ -370,29 +407,34 @@ app.post("/book-appointment", async (req, res) => {
   const fromNumber = req.body?.call?.from_number || null;
   const { name, start_time, phone } = payload;
 
-  // Resolve lead from DB
-  const lead = await getLeadByMulti({ callId, phone: phone || fromNumber });
+  console.log(`[book-appointment] FULL BODY: ${JSON.stringify(req.body)}`);
+  console.log(`[book-appointment] callId: ${callId} | name: ${name} | phone: ${phone} | start_time: ${start_time}`);
 
-  // Resolve email: prefer form data, fall back to auto-generated
+  const lead = await getLeadByMulti({ callId, phone: phone || fromNumber });
+  console.log(`[book-appointment] Lead resolved: ${lead ? lead.id + ' / ' + lead.name : 'not found'}`);
+
   const digits = String(phone || "").replace(/\D/g, "").slice(-10);
   const email =
     lead?.form_data?.email ||
     (digits ? `intake+${digits}@${process.env.EMAIL_DOMAIN || "buchananlaw.com"}` : null);
 
-  console.log("Book appointment:", { name, start_time, phone, callId, email });
+  console.log(`[book-appointment] Final — name: ${name}, phone: ${phone}, start_time: ${start_time}, email: ${email}`);
+
+  if (!name || !phone || !start_time) {
+    console.log("[book-appointment] Missing required fields");
+    logCallEvent(callId, { booking_attempted: true, booking_success: false, booking_error: "missing_fields" });
+    return res.json({
+      result: "I'm missing some details to complete the booking. The lead can book directly at " + process.env.CALENDLY_URL,
+      appointment_day: "",
+      appointment_time: "",
+    });
+  }
+
+  logCallEvent(callId, { booking_attempted: true, booking_start_time: start_time });
 
   try {
-    if (!name || !phone || !start_time) {
-      return res.json({
-        result: "I'm missing some details to complete the booking. The lead can book directly at " + process.env.CALENDLY_URL,
-        appointment_day: "",
-        appointment_time: "",
-      });
-    }
-
     const booking = await bookAppointment({ name, email, start_time, phone });
 
-    // Only mark booked on confirmed Calendly API success
     if (lead) {
       await updateLead(lead.id, {
         appointment_booked: true,
@@ -401,6 +443,9 @@ app.post("/book-appointment", async (req, res) => {
       });
     }
 
+    logCallEvent(callId, { booking_success: true, lead_id: lead?.id || null });
+    console.log(`[book-appointment] Booked successfully for ${name} at ${start_time}`);
+
     res.json({
       result: `Booked: Appointment confirmed for ${readableDay(start_time)} at ${readableHour(start_time)}. Our Intake Specialist will call at that time.`,
       appointment_day: readableDay(start_time),
@@ -408,19 +453,20 @@ app.post("/book-appointment", async (req, res) => {
       booking,
     });
   } catch (error) {
-    console.error("Book appointment error:", error.response?.data || error.message);
+    const errMsg = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+    console.error("[book-appointment] Error:", errMsg);
+    logCallEvent(callId, { booking_success: false, booking_error: errMsg });
     res.json({
       result: `I wasn't able to lock that in on my end. ${noSlotsMessage()}`,
       appointment_day: "",
       appointment_time: "",
-      error: error.response?.data || error.message,
+      error: errMsg,
     });
   }
 });
 
 // ─────────────────────────────────────────────
-// Retell webhook
-// POST /retell-webhook
+// POST /retell-webhook — Retell event handler
 // ─────────────────────────────────────────────
 app.post("/retell-webhook", async (req, res) => {
   try {
@@ -429,11 +475,26 @@ app.post("/retell-webhook", async (req, res) => {
     const call = event.call || event.data || {};
     const callId = call.call_id;
 
-    console.log(`Retell event: ${eventType} | Call: ${callId}`);
+    console.log(`[retell-webhook] event: ${eventType} | callId: ${callId}`);
+
+    // Log every event for observability
+    logWebhookEvent(eventType, callId, call);
 
     if (eventType === "call_started") {
       const lead = await getLeadByCallId(callId);
-      if (lead) await updateLead(lead.id, { call_status: "in_progress" });
+      console.log(`[call_started] from: ${call.from_number} | to: ${call.to_number} | lead found: ${!!lead}`);
+
+      if (lead) {
+        await updateLead(lead.id, { call_status: "in_progress" });
+      }
+
+      logCallEvent(callId, {
+        from_number: call.from_number || null,
+        to_number: call.to_number || null,
+        lead_found: !!lead,
+        lead_id: lead?.id || null,
+        call_started_at: new Date().toISOString(),
+      });
     }
 
     if (eventType === "call_ended") {
@@ -441,10 +502,14 @@ app.post("/retell-webhook", async (req, res) => {
       const transcript = call.transcript || "";
       const endedReason = call.disconnection_reason || "";
       const duration = call.duration_ms || 0;
+      const callSuccessful = call.call_analysis?.call_successful ?? null;
+      const userSentiment = call.call_analysis?.user_sentiment || "";
+      const taskRating = call.call_analysis?.agent_task_completion_rating || "";
+
+      console.log(`[call_ended] callId: ${callId} | reason: ${endedReason} | duration: ${Math.round(duration / 1000)}s | successful: ${callSuccessful}`);
 
       const lead = await getLeadByCallId(callId);
-      const noAnswer =
-        endedReason === "dial_no_answer" || endedReason === "customer_did_not_pick_up";
+      const noAnswer = endedReason === "dial_no_answer" || endedReason === "customer_did_not_pick_up";
 
       if (lead) {
         await updateLead(lead.id, {
@@ -459,14 +524,23 @@ app.post("/retell-webhook", async (req, res) => {
         if (noAnswer && (lead.call_attempts || 1) < 2) {
           const newAttempts = (lead.call_attempts || 1) + 1;
           await updateLead(lead.id, { call_attempts: newAttempts, call_status: "queued" });
-          console.log(`No answer — retrying (attempt ${newAttempts})`);
+          console.log(`[call_ended] No answer — scheduling retry (attempt ${newAttempts})`);
+
           triggerRetellCall({ ...lead, call_attempts: newAttempts })
             .then(async (callResult) => {
               const newCallId = callResult.call_id || callResult.id;
               await updateLead(lead.id, { call_id: newCallId });
-              console.log(`Retry call queued: ${newCallId}`);
+              logCallEvent(newCallId, {
+                from_number: process.env.TWILIO_PHONE_NUMBER || null,
+                to_number: lead.phone,
+                lead_id: lead.id,
+                call_triggered_at: new Date().toISOString(),
+                call_attempt: newAttempts,
+              });
+              console.log(`[call_ended] Retry call queued: ${newCallId}`);
             })
-            .catch((err) => console.error("Retry call failed:", err.response?.data || err.message));
+            .catch((err) => console.error("[call_ended] Retry call failed:", err.response?.data || err.message));
+
           return res.sendStatus(200);
         }
       }
@@ -487,7 +561,22 @@ app.post("/retell-webhook", async (req, res) => {
       )
         result = "disqualified";
 
-      // Zapier / Podio webhook
+      console.log(`[call_ended] Result: ${result} | appt_booked: ${apptBooked} | lead: ${lead?.name || "unknown"}`);
+
+      // Update call_logs with final outcome
+      logCallEvent(callId, {
+        call_ended_at: new Date().toISOString(),
+        disconnection_reason: endedReason,
+        duration_ms: duration,
+        lead_found: !!lead,
+        lead_id: lead?.id || null,
+        call_successful: callSuccessful,
+        user_sentiment: userSentiment,
+        task_completion_rating: taskRating,
+        result,
+      });
+
+      // Build webhook payload
       const zapierPayload = {
         call_id: callId,
         agent_id: call.agent_id || "",
@@ -507,7 +596,6 @@ app.post("/retell-webhook", async (req, res) => {
         source: lead?.source || "",
         email: lead?.form_data?.email || "",
 
-        // All original form fields
         ...(lead?.form_data || {}),
 
         result,
@@ -517,27 +605,41 @@ app.post("/retell-webhook", async (req, res) => {
 
         summary,
         transcript,
-        call_successful: call.call_analysis?.call_successful ?? null,
-        user_sentiment: call.call_analysis?.user_sentiment || "",
-        agent_task_completion_rating: call.call_analysis?.agent_task_completion_rating || "",
+        call_successful: callSuccessful,
+        user_sentiment: userSentiment,
+        agent_task_completion_rating: taskRating,
       };
 
       const zapierUrl = process.env.ZAPIER_WEBHOOK_URL;
       if (zapierUrl) {
         axios.post(zapierUrl, zapierPayload)
-          .catch((e) => console.error("Zapier webhook failed:", e.message));
+          .then(() => {
+            console.log(`[call_ended] Zapier webhook sent for ${callId}`);
+            logCallEvent(callId, { zapier_sent: true });
+          })
+          .catch((e) => {
+            console.error("[call_ended] Zapier webhook failed:", e.message);
+            logCallEvent(callId, { zapier_sent: false, zapier_error: e.message });
+          });
       }
 
       const podioUrl = process.env.PODIO_WEBHOOK_URL;
       if (podioUrl) {
         axios.post(podioUrl, zapierPayload)
-          .catch((e) => console.error("Podio webhook failed:", e.message));
+          .then(() => {
+            console.log(`[call_ended] Podio webhook sent for ${callId}`);
+            logCallEvent(callId, { podio_sent: true });
+          })
+          .catch((e) => {
+            console.error("[call_ended] Podio webhook failed:", e.message);
+            logCallEvent(callId, { podio_sent: false, podio_error: e.message });
+          });
       }
     }
 
     res.sendStatus(200);
   } catch (error) {
-    console.error("Webhook error:", error);
+    console.error("[retell-webhook] Unhandled error:", error.message);
     res.sendStatus(200);
   }
 });
